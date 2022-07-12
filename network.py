@@ -7,16 +7,19 @@ class Sine(nn.Module):
     def __init(self):
         super().__init__()
 
-    def forward(self, input):
-        return torch.sin(30 * input)
+    @torch.jit.script  # JIT decorator - element-wise fusion
+    def sin_(inp_):
+        return torch.sin(30 * inp_)
+
+    def forward(self, inp):
+        return self.sin_(inp)
 
 
 def sine_init(m):
     with torch.no_grad():
         if hasattr(m, 'weight'):
             num_input = m.weight.size(-1)
-            # See supplement Sec. 1.5 for discussion of factor 30
-            m.weight.uniform_(-np.sqrt(6 / num_input) / 30, np.sqrt(6 / num_input) / 30)
+            m.weight.uniform_(-np.sqrt(6 / num_input) / 30, np.sqrt(6 / num_input) / 30)  # according to paper
 
 
 def first_layer_sine_init(m):

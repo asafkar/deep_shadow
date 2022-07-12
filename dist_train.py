@@ -18,17 +18,45 @@ import numpy as np
 import argparse
 import kornia
 import time
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.multiprocessing as mp
 
 
-def run(args, task_name, use_clearml):
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+
+def run(rank, args, task_name, use_clearml):
+    # seed everything
+    torch.manual_seed(1)
+    random.seed(1)
+    np.random.seed(1)
+
+    if use_clearml and rank == 0:
+        from clearml import Task, Logger
+        task = Task.init(project_name="nerf2D_shading", task_name=task_name)
+        matplotlib.use('pdf')
+
+    print(f"running from rank = {rank}")
+    world_size = args.world_size
+
+    # setup the process groups
+    setup(rank, world_size)
+
     dev = args.dev
     train_loader = ShadowDataset(root=os.path.join(args.data_path, args.object), args=args, normalize_lights=False)
     c, h, w = train_loader[0][0].shape
     args.w, args.h = w, h
 
-    train_loader_idx = np.arange(len(train_loader))
-    light_sources_xyz = torch.empty((len(train_loader), 3), device=dev)
-    shade_maps = torch.empty((len(train_loader), h, w), device=dev)
+    all_light_idx = np.arange(len(train_loader))
+    relevant_light_idx = np.array_split(all_light_idx, args.world_size)[rank]
+    # print(f"rank={rank} relevant_light_idx={relevant_light_idx}")
+
+    light_sources_xyz = torch.empty((len(relevant_light_idx), 3), device=dev)
+    shade_maps = torch.empty((len(relevant_light_idx), h, w), device=dev)
     img_maps = torch.empty((len(train_loader), 3, h, w), device=dev)
 
     focal_length = train_loader.params["focal_length"]
@@ -36,11 +64,15 @@ def run(args, task_name, use_clearml):
     cam_location = (train_loader.params["cam_location_x"], train_loader.params["cam_location_y"], train_loader.params["cam_location_z"])
     img_plane_z = cam_location[2]  # FIXME - (focal_length / w)
 
+    # TODO DDP DataLoader?
     # load all images and light sources into memory
-    for jj in train_loader_idx:
+    ii = 0
+    for jj in all_light_idx:
         target_img, target_light_src, target_shadow = train_loader[jj]
-        light_sources_xyz[jj] = target_light_src.to(dev)
-        shade_maps[jj] = target_shadow.to(dev)
+        if jj in relevant_light_idx:
+            light_sources_xyz[ii] = target_light_src.to(dev)
+            shade_maps[ii] = target_shadow.to(dev)
+            ii += 1
         img_maps[jj] = target_img.to(dev)
 
     img_mean = img_maps.mean(dim=0)
@@ -53,16 +85,16 @@ def run(args, task_name, use_clearml):
     light_sources_uv = torch.stack([pnt_world_coords_to_pixel_coords(l, K_hom, RT) for l in light_sources_xyz], dim=0)
     depth_map = torch.from_numpy(train_loader.depth_exr).to(dev)
 
-    factor = train_loader.depth_exr.max()  # initialize with maximum depth for better convergence
     num_encoding_functions = args.num_enc_functions
-    depth_nerf = DepthNerf(num_encoding_functions, factor=factor, args=args).to(args.dev)
+    depth_nerf = DepthNerf(num_encoding_functions, args=args).to(args.dev)
+    depth_nerf = DDP(depth_nerf)
 
-    depth_params = set(depth_nerf.parameters())-set([depth_nerf.factor])
+    depth_params = set(depth_nerf.parameters())
 
-    criterion = torch.nn.L1Loss()
-    criterion2 = torch.nn.MSELoss()
+    criterion = torch.nn.L1Loss(reduction='none')
+    criterion2 = torch.nn.MSELoss(reduction='none')
     optimizer = torch.optim.AdamW(depth_params, lr=args.learning_rate, weight_decay=1e-6)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.epochs // 18, gamma=0.9, verbose=False)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.epochs / 25, gamma=0.9, verbose=False)
 
     if args.checkpoint:
         print(f"Loading from checkpoint {args.checkpoint}")
@@ -108,7 +140,6 @@ def run(args, task_name, use_clearml):
                 u_, v_ = torch.div(flat_idx, w, rounding_mode='floor'), flat_idx % h
                 curr_light_sources_vu = torch.stack([u_, v_])
 
-            # print(f"Generating lines for idx={idx} curr_light_src={curr_light_sources_vu}")
             lines_arr.append(gen_lines_from_src_to_points(points_to_calc.cpu(), curr_light_sources_vu.cpu(), w - 1, h - 1))
         return lines_arr
 
@@ -150,8 +181,8 @@ def run(args, task_name, use_clearml):
 
             if line_loss:
                 # take loss between predicted shading along line and GT sampled shading
-                loss = (criterion2(pred_shading, shaded_gt_line_sampled)) \
-                       + (criterion(pred_shading, shaded_gt_line_sampled))
+                loss = (criterion2(pred_shading, shaded_gt_line_sampled)).sum() \
+                       + (criterion(pred_shading, shaded_gt_line_sampled)).sum()
                 running_loss += loss
 
             else:  # loss on whole image
@@ -161,11 +192,8 @@ def run(args, task_name, use_clearml):
                     shadow_hat[[*line_sample_coords[:, -1]]] = pred_shading
 
         if not line_loss:
-            loss = criterion(shaded_gt, shadow_hat) + criterion2(shaded_gt, shadow_hat)
-            # if iter > 250:
+            loss = criterion(shaded_gt, shadow_hat).mean() + criterion2(shaded_gt, shadow_hat).mean()
             loss += 0.1 * kornia.losses.inverse_depth_smoothness_loss(depth_hat.view(1, 1, w, h), img_mean.unsqueeze(0))
-            # else:
-            #     loss += 0.1 * (depth_hat - kornia.filters.box_blur(depth_hat.view(1, 1, w, h), (3, 3)).squeeze()).abs().mean()
             running_loss += loss
 
         # take backwards step on every image
@@ -203,7 +231,7 @@ def run(args, task_name, use_clearml):
 
             if use_clearml:
                 Logger.current_logger().report_scalar(title="sine_mult_factor", series="parameters",
-                    value=depth_nerf.factor, iteration=iter)
+                    value=depth_nerf.module.factor, iteration=iter)
                 # Logger.current_logger().report_scalar(title="sine_bias", series="parameters", value=depth_nerf.bias, iteration=iter)
                 Logger.current_logger().report_scalar(title="depth_output_max", series="parameters",
                     value=depth_hat.max(), iteration=iter)
@@ -346,7 +374,8 @@ def run(args, task_name, use_clearml):
                     Logger.current_logger().report_scalar(title=f"{label}/normals mean angle error", series="args",
                         value=angular_error_sum.cpu().numpy(), iteration=iter)
 
-                print(f"Surface Normals Prediction Error = {angular_error_sum.cpu().numpy()}")
+                if ii == 0:
+                    print(f"Surface Normals Prediction Error = {angular_error_sum.cpu().numpy()}")
 
             if use_clearml:
                 Logger.current_logger().report_image("normal GT", "image float", iteration=iter,
@@ -357,15 +386,6 @@ def run(args, task_name, use_clearml):
 
     for iter in range(args.epochs):  # epochs
         epoch_start_time = time.time()
-        if iter < 100:
-            args.temp = -10
-        elif iter < 300:
-            args.temp = -30
-        elif iter < 500:
-            args.temp = -50
-        else:
-            args.temp = -80
-
 
         # if accumulating grads (take loss after all images, predict depth_hat only once per epoch)
         if (not args.step_every_img) or (iter in iter_sampling_pairs.keys()):
@@ -390,30 +410,37 @@ def run(args, task_name, use_clearml):
             optimizer.step()
 
         scheduler.step()
-        if use_clearml:
+        if use_clearml and rank == 0:
             Logger.current_logger().report_scalar(title="learning_rate", series="args", value=scheduler.get_last_lr()[0],
                 iteration=iter)
             Logger.current_logger().report_scalar(title="loss", series="Accuracy", value=running_loss, iteration=iter)
 
         epoch_end_train_time = time.time()
         print(f"epoch {iter} train time took {epoch_end_train_time - epoch_start_time}")
-        print(f"epoch {iter} running loss = {running_loss}")
+        # print(f"epoch {iter} running loss = {running_loss}")
 
+        # dist.barrier()
         # every X iterations, print error between GT depth and predicted depth
-        if iter % 50 == 0:
+        if iter % 50 == 0 and rank == 0:
             depth_hat = depth_nerf(all_depth_coords_encoded).reshape(w, h)
             test(depth_hat)
             # profiler.step()
 
+    def cleanup():
+        dist.destroy_process_group()
+
+    cleanup()
+
 
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser(description='Description of your program')
-    parser.add_argument('-o', '--object', help='Description ', default='sculptures')
+    parser.add_argument('-o', '--object', help='Description ', default='rose')
     parser.add_argument('--speed', help='fast, medium or slow ', default='fast')
-    parser.add_argument('-lr', '--learning_rate', help='Description ', default=5e-5)
+    parser.add_argument('-lr', '--learning_rate', help='Description ', default=8e-5)
     parser.add_argument('-d', '--dev', help='device', required=False, default='cpu')
     parser.add_argument('--temp', help='temp of sigmoid', required=False, default=-25)
-    parser.add_argument('--epochs', help='epochs', required=False, type=int, default=1300)
+    parser.add_argument('--epochs', help='epochs', required=False, type=int, default=1000)
     parser.add_argument('--filter_size', help='latent var for nerf', required=False, default=128)
     parser.add_argument('--num_enc_functions', help='encoding functions', required=False, default=5)
     parser.add_argument('--checkpoint', help='Checkpoint to continue training from', default=None)
@@ -421,31 +448,21 @@ if __name__ == "__main__":
     parser.add_argument('--save_dir', help='dir to save models ', default='/tmp/deep_shadow/models/')
     parser.add_argument('--data_path', help='path to dataset ', default='./data/')
     parser.add_argument('--alternative_light_uv_method', help='Description ', default=True)
+    parser.add_argument('--world_size', help='Description ', type=int, default=1)
     args_ = parser.parse_args()
 
-    task_name_ = f"VERIFY2_dev={args_.dev} {args_.object} Step_gamma_0.9 {args_.learning_rate} L2+L1 enc_func={args_.num_enc_functions}" \
-                f"filter_size={args_.filter_size} learned_mult init to 11"
+    task_name_ = f"DISTRIBUTED_num_nodes{args_.world_size} shading dev={args_.dev} {args_.object} Step_gamma_0.9 {args_.learning_rate} L2+L1 enc_func={args_.num_enc_functions}" \
+                f"filter_size={args_.filter_size} learned_mult init to 10"
     task_name_ = task_name_.replace(" ", "_")
 
-    if not os.path.isdir(args_.save_dir):
-        os.makedirs(args_.save_dir, mode=0o777)
-
-
     use_clearml_ = True
-    if use_clearml_:
-        from clearml import Task, Logger
-        task = Task.init(project_name="nerf2D_shading", task_name=task_name_)
-        matplotlib.use('pdf')
-
     writer = SummaryWriter(task_name_)
-
-    # seed everything
-    torch.manual_seed(1)
-    random.seed(1)
-    np.random.seed(1)
 
     print(" ---------------------------------------------------------- ")
     print(f"Running: {task_name_}")
     print(" ---------------------------------------------------------- ")
 
-    run(args_, task_name_, use_clearml_)
+    mp.spawn(run,
+             args=(args_, task_name_, use_clearml_,),
+             nprocs=args_.world_size,
+             join=True)
