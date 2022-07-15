@@ -1,5 +1,3 @@
-# TODO https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html
-
 import os
 from tensorboardX import SummaryWriter
 import random

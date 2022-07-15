@@ -1,4 +1,5 @@
 # TODO https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html
+# WIP should be fine-tuned
 
 import os
 from tensorboardX import SummaryWriter
