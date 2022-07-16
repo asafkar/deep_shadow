@@ -1,5 +1,5 @@
 import os
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 import random
 
 from datasets.ShadowData import ShadowDataset
@@ -17,45 +17,75 @@ import argparse
 import kornia
 import time
 
+from PIL import Image
 
-def run(args, task_name, use_clearml):
-    dev = args.dev
-    train_loader = ShadowDataset(root=os.path.join(args.data_path, args.object), args=args, normalize_lights=False)
-    c, h, w = train_loader[0][0].shape
-    args.w, args.h = w, h
-
-    train_loader_idx = np.arange(len(train_loader))
-    light_sources_xyz = torch.empty((len(train_loader), 3), device=dev)
-    shade_maps = torch.empty((len(train_loader), h, w), device=dev)
-    img_maps = torch.empty((len(train_loader), 3, h, w), device=dev)
-
-    focal_length = train_loader.params["focal_length"]
-
-    cam_location = (train_loader.params["cam_location_x"], train_loader.params["cam_location_y"], train_loader.params["cam_location_z"])
-    img_plane_z = cam_location[2]  # FIXME - (focal_length / w)
+def prep_data_for_training(data_loader, args):
+    train_loader_idx = np.arange(len(data_loader))
+    light_sources_xyz = torch.empty((len(data_loader), 3), device=args.dev)
+    shade_maps = torch.empty((len(data_loader), args.h, args.w), device=args.dev)
+    img_maps = torch.empty((len(data_loader), 3, args.h, args.w), device=args.dev)
 
     # load all images and light sources into memory
     for jj in train_loader_idx:
-        target_img, target_light_src, target_shadow = train_loader[jj]
-        light_sources_xyz[jj] = target_light_src.to(dev)
-        shade_maps[jj] = target_shadow.to(dev)
-        img_maps[jj] = target_img.to(dev)
+        target_img, target_light_src, target_shadow = data_loader[jj]
+        light_sources_xyz[jj] = target_light_src.to(args.dev)
+        shade_maps[jj] = target_shadow.to(args.dev)
+        img_maps[jj] = target_img.to(args.dev)
 
     img_mean = img_maps.mean(dim=0)
     del img_maps
 
+    return shade_maps, light_sources_xyz, img_mean
+
+
+def lights_in_frustrum(data_loader, light_sources_uv, light_sources_xyz, args):
+    cam_location = (data_loader.params["cam_location_x"], data_loader.params["cam_location_y"], data_loader.params["cam_location_z"])
+    light_sources_vu = light_sources_uv[:].flip(0)
+    cam_location_z = cam_location[2]  # assumes cam at (0,0, Pz) - can be later generalized.
+
+    lightsrc_in_frustrum = (light_sources_xyz[..., 2] > cam_location_z)
+
+    for light_idx in range(len(data_loader)):
+        curr_light_sources_vu = light_sources_vu[light_idx]
+        light_src_in_frame = (0 <= curr_light_sources_vu[1] <= args.w) and (0 <= curr_light_sources_vu[0] <= args.h)
+        lightsrc_in_frustrum[light_idx] *= (not light_src_in_frame)
+
+    return lightsrc_in_frustrum
+
+
+# if light source is above and "in" the image plane,
+# find the coordinates of point in the pointcloud that is closest to the lightsrc, and use its index for uv
+def nearest_pnt_to_light_src(light_source_xyz, xyz, args):
+    flat_idx = torch.argmin(torch.sqrt(((light_source_xyz[:2].view(-1, 1, 1).expand(2, args.w, args.h)
+                - xyz.squeeze()[:2]) ** 2).sum(0)))
+    u_, v_ = torch.div(flat_idx, args.w, rounding_mode='floor'), flat_idx % args.h
+    curr_light_sources_vu = torch.stack([u_, v_])
+    return curr_light_sources_vu
+
+
+def run(args, task_name):
+    writer = SummaryWriter(task_name_)
+
+    data_loader = ShadowDataset(root=os.path.join(args.data_path, args.object), args=args, normalize_lights=False)
+    c, h, w = data_loader[0][0].shape
+    args.w, args.h = w, h
+
+    focal_length = data_loader.params["focal_length"]
+    shade_maps, light_sources_xyz, img_mean = prep_data_for_training(data_loader, args)
+
     K_hom = get_camera_intrinsics(w, h, focal_length).to(args.dev)
     K = K_hom[:, :3, :3]
     RT = get_camera_extrinsics().to(args.dev)
-
     light_sources_uv = torch.stack([pnt_world_coords_to_pixel_coords(l, K_hom, RT) for l in light_sources_xyz], dim=0)
-    depth_map = torch.from_numpy(train_loader.depth_exr).to(dev)
+    depth_map = torch.from_numpy(data_loader.depth_exr).to(args.dev)
 
-    factor = train_loader.depth_exr.max()  # initialize with maximum depth for better convergence
+    lightsrc_in_frustrum = lights_in_frustrum(data_loader, light_sources_uv, light_sources_xyz, args)
+
+    factor = data_loader.depth_exr.max()  # initialize model with maximum depth
     num_encoding_functions = args.num_enc_functions
     depth_nerf = DepthNerf(num_encoding_functions, factor=factor, args=args).to(args.dev)
 
-    depth_params = set(depth_nerf.parameters())-set([depth_nerf.factor])
+    depth_params = set(depth_nerf.parameters())-set([depth_nerf.factor])  # don't optimize factor
 
     criterion = torch.nn.L1Loss()
     criterion2 = torch.nn.MSELoss()
@@ -66,7 +96,6 @@ def run(args, task_name, use_clearml):
         print(f"Loading from checkpoint {args.checkpoint}")
         checkpoint = torch.load(args.checkpoint)
         depth_nerf.load_state_dict(checkpoint['model_state_dict'])
-        # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
     # Speedup - draw coordinate lines to boundary points, and use result on all intermediate points.
     # No speedup - generate coordinate lines to every pixel, calculate shading on
@@ -74,14 +103,11 @@ def run(args, task_name, use_clearml):
     speed_up_calculation = args.speed == "fast"
 
     # generate all positional encoded points for NeRF input
-    mesh_query_points = (get_ray_bundle(h, w, normalize=True).reshape((-1, 2))).to(dev)
+    mesh_query_points = (get_ray_bundle(h, w, normalize=True).reshape((-1, 2))).to(args.dev)
 
     all_depth_coords_encoded = [positional_encoding(mesh_query_points[jj, :], num_encoding_functions=num_encoding_functions)
         for jj in range(w * h)]
     all_depth_coords_encoded = torch.stack(all_depth_coords_encoded).to(args.dev)
-
-    # Whether to calculate loss over each line, or accumulate all lines and then calculate the loss
-    line_loss = False
 
     # pre-calculate and cache all lines for sampling the predicted depth, since these are expensive calculations
     def pre_gen_lines_arr(boundary_subsampling_factor, xyz):
@@ -91,7 +117,7 @@ def run(args, task_name, use_clearml):
             num_points=num_points_on_square_boundary)
 
         # all coordinate points (used instead of boundary points, if those aren't used)
-        all_points = get_ray_bundle(h, w, normalize=False).reshape((-1, 2)).to(dev)
+        all_points = get_ray_bundle(h, w, normalize=False).reshape((-1, 2)).to(args.dev)
         points_to_calc = boundary_points if speed_up_calculation else all_points
 
         for idx in range(len(light_sources_uv)):  # go over all light sources
@@ -100,13 +126,9 @@ def run(args, task_name, use_clearml):
             light_src_in_frame = (0 <= curr_light_sources_vu[1] <= w) and (0 <= curr_light_sources_vu[0] <= h)
             points_to_calc = points_to_calc.flip(1)
 
-            if light_src_in_frame and args.alternative_light_uv_method:
-                flat_idx = torch.argmin(torch.sqrt(
-                    ((light_sources_xyz[idx][:2].view(-1, 1, 1).expand(2, w, h) - xyz.squeeze()[:2]) ** 2).sum(0)))
-                u_, v_ = torch.div(flat_idx, w, rounding_mode='floor'), flat_idx % h
-                curr_light_sources_vu = torch.stack([u_, v_])
+            if light_src_in_frame:
+                curr_light_sources_vu = nearest_pnt_to_light_src(light_sources_xyz[idx], xyz, args)
 
-            # print(f"Generating lines for idx={idx} curr_light_src={curr_light_sources_vu}")
             lines_arr.append(gen_lines_from_src_to_points(points_to_calc.cpu(), curr_light_sources_vu.cpu(), w - 1, h - 1))
         return lines_arr
 
@@ -119,23 +141,16 @@ def run(args, task_name, use_clearml):
                             }
 
     def train_single_light_src(light_idx, depth_nerf, optimizer, running_loss):
-        shadow_hat = torch.zeros_like(depth_map, device=dev, dtype=torch.float32)
-
-        if args.step_every_img:
-            noise = torch.randn_like(all_depth_coords_encoded) * 0.0001
-            depth_hat = depth_nerf(all_depth_coords_encoded + noise).reshape(w, h)
-            xyz = depth_map_to_pointcloud(depth_hat, K, RT, w, h).unsqueeze(0).permute(0, 3, 1, 2)
+        shadow_hat = torch.zeros_like(depth_map, device=args.dev, dtype=torch.float32)
+        noise = torch.randn_like(all_depth_coords_encoded) * 0.0001
+        depth_hat = depth_nerf(all_depth_coords_encoded + noise).reshape(w, h)
+        xyz = depth_map_to_pointcloud(depth_hat, K, RT, w, h).unsqueeze(0).permute(0, 3, 1, 2)
 
         lines = lines_arr[light_idx]
 
-        curr_light_sources_vu = light_sources_uv[light_idx].flip(0)
-        light_src_in_frame = (0 <= curr_light_sources_vu[1] <= w) and (0 <= curr_light_sources_vu[0] <= h)
-
-        if line_loss:
-            running_loss = 0
         for jdx, line in enumerate(lines):  # go over each line from src to boundary
-            if light_sources_xyz[light_idx][2] > img_plane_z and not (
-                        light_src_in_frame and args.alternative_light_uv_method):  # if light is behind camera plane, reverse scan order
+            # if light is behind camera plane, reverse scan order
+            if lightsrc_in_frustrum[light_idx]:
                 line = line.flip(1)
             shaded_gt = shade_maps[light_idx]
             line_sample_coords = line.round().long()
@@ -146,39 +161,27 @@ def run(args, task_name, use_clearml):
                 line, xyz.squeeze(), temp=args.temp, eps=1e-4 if iter < (args.epochs * 0.8) else 1e-5,
                 return_last_points_only=(not speed_up_calculation))
 
-            if line_loss:
-                # take loss between predicted shading along line and GT sampled shading
-                loss = (criterion2(pred_shading, shaded_gt_line_sampled)) \
-                       + (criterion(pred_shading, shaded_gt_line_sampled))
-                running_loss += loss
+            if speed_up_calculation:
+                shadow_hat[[*line_sample_coords]] = pred_shading.float()
+            else:
+                shadow_hat[[*line_sample_coords[:, -1]]] = pred_shading
 
-            else:  # loss on whole image
-                if speed_up_calculation:
-                    shadow_hat[[*line_sample_coords]] = pred_shading.float()
-                else:
-                    shadow_hat[[*line_sample_coords[:, -1]]] = pred_shading
-
-        if not line_loss:
-            loss = criterion(shaded_gt, shadow_hat) + criterion2(shaded_gt, shadow_hat)
-            # if iter > 250:
-            loss += 0.1 * kornia.losses.inverse_depth_smoothness_loss(depth_hat.view(1, 1, w, h), img_mean.unsqueeze(0))
-            # else:
-            #     loss += 0.1 * (depth_hat - kornia.filters.box_blur(depth_hat.view(1, 1, w, h), (3, 3)).squeeze()).abs().mean()
-            running_loss += loss
+        loss = criterion(shaded_gt, shadow_hat) + criterion2(shaded_gt, shadow_hat)
+        # if iter > 250:
+        loss += 0.1 * kornia.losses.inverse_depth_smoothness_loss(depth_hat.view(1, 1, w, h), img_mean.unsqueeze(0))
+        # else:
+        #     loss += 0.1 * (depth_hat - kornia.filters.box_blur(depth_hat.view(1, 1, w, h), (3, 3)).squeeze()).abs().mean()
+        running_loss += loss
 
         # take backwards step on every image
-        if args.step_every_img:
-            optimizer.zero_grad(set_to_none=True)
-            if line_loss:
-                running_loss.backward()
-            else:
-                loss.backward()
-
-            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
 
         return running_loss
 
-    def test(depth_hat):
+    def test(depth_hat, writer):
+
         with torch.no_grad():
             print(f"saving model iter {iter} in {args.save_dir}/{task_name}_{iter}_snapshot.pth")
             torch.save({
@@ -199,59 +202,41 @@ def run(args, task_name, use_clearml):
             normed_depth_map /= normed_depth_map.max()
             normed_depth_map = normed_depth_map
 
-            if use_clearml:
-                Logger.current_logger().report_scalar(title="sine_mult_factor", series="parameters",
-                    value=depth_nerf.factor, iteration=iter)
-                # Logger.current_logger().report_scalar(title="sine_bias", series="parameters", value=depth_nerf.bias, iteration=iter)
-                Logger.current_logger().report_scalar(title="depth_output_max", series="parameters",
-                    value=depth_hat.max(), iteration=iter)
-                Logger.current_logger().report_scalar(title="depth_output_min", series="parameters",
-                    value=depth_hat.min(), iteration=iter)
+            writer.add_scalar('Model/max_depth_value', depth_hat.max(), iter)
+            writer.add_scalar('Model/min_depth_value', depth_hat.min(), iter)
 
-                grid_gt = torchvision.utils.make_grid(
-                    [shade_maps[ii].cpu().unsqueeze(0) for ii in range(len(light_sources_uv))])
-                Logger.current_logger().report_image("shading_gt", "image float", iteration=iter,
-                    image=grid_gt.permute(1, 2, 0).cpu().numpy())
+            grid_gt = torchvision.utils.make_grid([shade_maps[ii].cpu().unsqueeze(0) for ii in range(len(light_sources_uv))])
+            writer.add_image("Shadow_GT", grid_gt.cpu().numpy(), iter)
+            writer.add_scalar('depth absolute error', err.mean(), iter)
 
-                Logger.current_logger().report_scalar(title="depth absolute error", series="Accuracy", value=err.mean(),
-                    iteration=iter)
-                err_scaled = torch.abs(depth_hat - depth_map) / (depth_map.max() - depth_map.min())
-                Logger.current_logger().report_scalar(title="depth absolute error scaled by h_max_min",
-                    series="Accuracy",
-                    value=err_scaled.mean().cpu() * 100, iteration=iter)
+            err_normed = torch.abs(((normed_pred_depth_map.reshape(w, h)) - normed_depth_map)).cpu()
+            print(f"Normed Depth Prediction Error = {err_normed.mean()}")
+            writer.add_image('normalized depth abs diff', err_normed.unsqueeze(0).numpy(), iter)
+            writer.add_image('depth_GT normed', data_loader.depth_exr_normed[np.newaxis, :, :], iter)
+            writer.add_image('depth pred normed', (data_loader.silhouette_gt.cpu().numpy()
+                              * normed_pred_depth_map.cpu().numpy())[np.newaxis, :, :], iter)
+            writer.add_scalar('normalized depth absolute error', err_normed.mean(), iter)
 
-                err_normed = torch.abs(((normed_pred_depth_map.reshape(w, h)) - normed_depth_map)).cpu()
-                Logger.current_logger().report_image("normalized depth abs diff", "image float", iteration=iter,
-                    image=err_normed.numpy())
-                print(f"Normed Depth Prediction Error = {err_normed.mean()}")
-                Logger.current_logger().report_scalar(title="normalized depth absolute error", series="Accuracy",
-                    value=err_normed.mean(), iteration=iter)
-
-                Logger.current_logger().report_image("depth_GT normed", "image float", iteration=iter,
-                    image=train_loader.depth_exr_normed)
-
-                Logger.current_logger().report_image("depth pred normed", "image float", iteration=iter,
-                    image=train_loader.silhouette_gt.cpu().numpy() * normed_pred_depth_map.cpu().numpy())
-
+            if args.use_clearml:
                 fig1 = plt.figure(1)
                 plt1 = plt.imshow(depth_hat.cpu().numpy(), cmap='hot')
                 plt.colorbar(plt1)
                 Logger.current_logger().report_matplotlib_figure(title="Pred depth heatmap",
-                    series="depth", iteration=iter, figure=plt, report_image=True)
+                        series="depth", iteration=iter, figure=plt, report_image=True)
                 fig1.clear()
 
                 fig2 = plt.figure(2)
-                plt2 = plt.imshow(train_loader.depth_exr, cmap='hot')
+                plt2 = plt.imshow(data_loader.depth_exr, cmap='hot')
                 plt.colorbar(plt2)
                 Logger.current_logger().report_matplotlib_figure(title="GT depth heatmap",
-                    series="depth", iteration=iter, figure=plt, report_image=True)
+                        series="depth", iteration=iter, figure=plt, report_image=True)
                 fig2.clear()
 
-            ###### calc all predicted shadings and save them to grid
+            # calculate all predicted shadows and save them to grid
             shadows_hat_arr = []
             num_points_on_square_boundary = w
             boundary_points = generate_square_boundaries((0, 0), (w - 1, h - 1), num_points_on_square_boundary)
-            all_points = get_ray_bundle(h, w, normalize=False).reshape((-1, 2)).to(dev)
+            all_points = get_ray_bundle(h, w, normalize=False).reshape((-1, 2)).to(args.dev)
 
             points_to_calc = boundary_points if speed_up_calculation else all_points
 
@@ -261,31 +246,27 @@ def run(args, task_name, use_clearml):
                 light_src_in_frame = (0 <= curr_light_sources_vu[1] <= w) and (0 <= curr_light_sources_vu[0] <= h)
                 points_to_calc = points_to_calc.flip(1)
 
-                if light_src_in_frame and args.alternative_light_uv_method:
-                    flat_idx = torch.argmin(torch.sqrt(
-                        ((light_sources_xyz[idx_sample][:2].view(-1, 1, 1).expand(2, w, h) - xyz.squeeze()[
-                        :2]) ** 2).sum(0)))
-                    u_, v_ = torch.div(flat_idx, w, rounding_mode='floor'), flat_idx % h
-                    curr_light_sources_vu = torch.stack([u_, v_])
+                if light_src_in_frame:
+                    curr_light_sources_vu = nearest_pnt_to_light_src(light_sources_xyz[idx_sample], xyz, args)
 
                 # for light_src in light_sources:
                 lines = gen_lines_from_src_to_points(points_to_calc.cpu(), curr_light_sources_vu.cpu(), w - 1,
                     h - 1)
-                shadow_hat = torch.zeros_like(depth_map, device=dev, dtype=torch.float32)
+                shadow_hat = torch.zeros_like(depth_map, device=args.dev, dtype=torch.float32)
 
                 # add missing points
                 if iter > args.epochs // 2:
-                    dummy_res = torch.zeros_like(depth_map, device=dev, dtype=torch.float32)
+                    dummy_res = torch.zeros_like(depth_map, device=args.dev, dtype=torch.float32)
                     all_lines = torch.cat(lines, dim=1).round().long()
                     dummy_res[[*all_lines]] += 1
-                    missing_points = torch.stack((dummy_res == torch.Tensor([0]).to(dev)).nonzero(as_tuple=True)).T
+                    missing_points = torch.stack((dummy_res == torch.Tensor([0]).to(args.dev)).nonzero(as_tuple=True)).T
                     missing_lines = gen_lines_from_src_to_points(missing_points.cpu(), curr_light_sources_vu.cpu(),
                         w - 1, h - 1)
                     lines = lines + missing_lines
 
                 for idx, line in enumerate(lines):  # go over each line from src to boundary
-                    if light_sources_xyz[idx_sample][2] > img_plane_z and not (
-                                light_src_in_frame and args.alternative_light_uv_method):  # if light is behind camera plane, reverse scan order
+                    # if light is behind camera plane, reverse scan order
+                    if lightsrc_in_frustrum[idx_sample]:
                         line = line.flip(1)
                     num_pts = line.shape[1]
                     if num_pts <= 1:  # boundary point, line of length 0
@@ -293,8 +274,6 @@ def run(args, task_name, use_clearml):
                         continue
 
                     line_sample_coords = line.round().long()
-                    shaded_gt_line_sampled = depth_hat[[*line_sample_coords]]
-
                     pred_shading, real_shading = get_los_2d_worldcoords(light_sources_xyz[idx_sample],
                         line, xyz.squeeze(), temp=args.temp,
                         return_last_points_only=(not speed_up_calculation))
@@ -306,52 +285,37 @@ def run(args, task_name, use_clearml):
 
                 shadows_hat_arr.append(shadow_hat.cpu().unsqueeze(0))
 
-            if use_clearml:
-                grid = torchvision.utils.make_grid(shadows_hat_arr)
-                Logger.current_logger().report_image("shading_hat sigmoid all angles", "image float", iteration=iter,
-                    image=grid.permute(1, 2, 0).cpu().numpy())
+            grid = torchvision.utils.make_grid(shadows_hat_arr)
+            writer.add_image('predicted_shadows', grid.cpu().numpy(), iter)
+            writer.add_image('shadow_error', (grid - grid_gt).abs().cpu().numpy(), iter)
 
-                Logger.current_logger().report_image("shading difference all angles", "image float", iteration=iter,
-                    image=(grid - grid_gt).abs().permute(1, 2, 0).cpu().numpy())
+            # Compute predicted normals for this depth
+            depth_img = depth_hat.reshape(w, h)
+            xyz = depth_map_to_pointcloud(depth_img, K, RT, w, h).unsqueeze(0).permute(0, 3, 1, 2)
 
-            ##### Compute predicted normals for this depth
-            for ii, pred_depth in enumerate([depth_hat]):
-                label = "regular" if ii == 0 else "normed"
-                depth_img = pred_depth.reshape(w, h)
-                xyz = depth_map_to_pointcloud(depth_img, K, RT, w, h).unsqueeze(0).permute(0, 3, 1, 2)
+            # compute the pointcloud spatial gradients
+            gradients: torch.Tensor = kornia.filters.spatial_gradient(xyz, mode='diff', order=1)  # Bx3x2xHxW
 
-                # compute the pointcloud spatial gradients
-                gradients: torch.Tensor = kornia.filters.spatial_gradient(xyz, mode='diff', order=1)  # Bx3x2xHxW
+            # compute normals
+            a, b = gradients[:, :, 0], gradients[:, :, 1]  # Bx3xHxW
 
-                # compute normals
-                a, b = gradients[:, :, 0], gradients[:, :, 1]  # Bx3xHxW
+            normals_kornia: torch.Tensor = torch.cross(a, b, dim=1).squeeze()  # 3xHxW
+            normals_kornia = F.normalize(normals_kornia, dim=0, p=2)
+            normals_kornia = -1 * normals_kornia.permute(1, 2, 0)
 
-                normals_kornia: torch.Tensor = torch.cross(a, b, dim=1).squeeze()  # 3xHxW
-                normals_kornia = F.normalize(normals_kornia, dim=0, p=2)
-                normals_kornia = -1 * normals_kornia.permute(1, 2, 0)
+            angular_error, angular_error_sum = norm_diff(normals_kornia.permute(2, 0, 1), data_loader.normal_gt,
+                data_loader.silhouette_gt)
 
-                angular_error, angular_error_sum = norm_diff(normals_kornia.permute(2, 0, 1), train_loader.normal_gt,
-                    train_loader.silhouette_gt)
+            writer.add_image('predicted_normals',
+                (data_loader.silhouette_gt.unsqueeze(0).cpu().numpy()
+                 * ((normals_kornia.cpu().numpy().transpose(2, 0, 1) + 1) / 2)), iter)
 
-                if use_clearml:
-                    Logger.current_logger().report_image(f"{label}/normal_from_depth", "image float", iteration=iter,
-                        image=(train_loader.silhouette_gt.unsqueeze(2).cpu().numpy() * np.int16(
-                            ((normals_kornia.cpu().numpy() + 1) / 2) * 255)))
+            writer.add_image('normals_err_map', angular_error.cpu().numpy()[np.newaxis, ...], iter)
+            writer.add_image('normals_GT', data_loader.silhouette_gt.unsqueeze(0).cpu().numpy()
+                    * 0.5 * (data_loader.normal_gt + 1).cpu().numpy(), iter)
 
-                    Logger.current_logger().report_image(f"{label}/normal error map", "image float", iteration=iter,
-                        image=angular_error.cpu().numpy())
-
-                    Logger.current_logger().report_scalar(title=f"{label}/normals mean angle error", series="args",
-                        value=angular_error_sum.cpu().numpy(), iteration=iter)
-
-                print(f"Surface Normals Prediction Error = {angular_error_sum.cpu().numpy()}")
-
-            if use_clearml:
-                Logger.current_logger().report_image("normal GT", "image float", iteration=iter,
-                    image=train_loader.silhouette_gt.unsqueeze(2).cpu().numpy() * 0.5 * (
-                                    train_loader.normal_gt + 1).permute(1, 2, 0).cpu().numpy())
-
-            # plot_pointcloud(xyz, iter)
+            writer.add_scalar('normals mean angle error', angular_error_sum.cpu().numpy(), iter)
+            print(f"Surface Normals Prediction Error = {angular_error_sum.cpu().numpy()}")
 
     for iter in range(args.epochs):  # epochs
         epoch_start_time = time.time()
@@ -364,49 +328,37 @@ def run(args, task_name, use_clearml):
         else:
             args.temp = -80
 
-
-        # if accumulating grads (take loss after all images, predict depth_hat only once per epoch)
-        if (not args.step_every_img) or (iter in iter_sampling_pairs.keys()):
+        # coarse to fine boundary sampling:
+        if iter in iter_sampling_pairs.keys():
             noise = torch.randn_like(all_depth_coords_encoded) * 0.0001
             depth_hat = depth_nerf(all_depth_coords_encoded + noise).reshape(w, h)
             xyz = depth_map_to_pointcloud(depth_hat, K, RT, w, h).unsqueeze(0).permute(0, 3, 1, 2)
-
-        # coarse to fine boundary sampling:
-        if iter in iter_sampling_pairs.keys():
             lines_arr = pre_gen_lines_arr(iter_sampling_pairs[iter], xyz)
 
         running_loss = 0.0
-
         for idx in range(len(light_sources_uv)):  # go over all light sources
             running_loss += train_single_light_src(idx, depth_nerf, optimizer, running_loss)
 
-        if not args.step_every_img:
-            # take backwards step after all images
-            optimizer.zero_grad(set_to_none=True)
-
-            running_loss.backward()
-            optimizer.step()
-
         scheduler.step()
-        if use_clearml:
-            Logger.current_logger().report_scalar(title="learning_rate", series="args", value=scheduler.get_last_lr()[0],
-                iteration=iter)
-            Logger.current_logger().report_scalar(title="loss", series="Accuracy", value=running_loss, iteration=iter)
+
+        writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], iter)
+        writer.add_scalar('Train_loss', running_loss, iter)
 
         epoch_end_train_time = time.time()
-        print(f"epoch {iter} train time took {epoch_end_train_time - epoch_start_time}")
-        print(f"epoch {iter} running loss = {running_loss}")
+        # print(f"epoch {iter} train time took {epoch_end_train_time - epoch_start_time}")
+        if iter % 10 == 0:
+            print(f"epoch {iter} running loss = {running_loss}")
 
         # every X iterations, print error between GT depth and predicted depth
         if iter % 50 == 0:
             depth_hat = depth_nerf(all_depth_coords_encoded).reshape(w, h)
-            test(depth_hat)
+            test(depth_hat, writer)
             # profiler.step()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Description of your program')
-    parser.add_argument('-o', '--object', help='Description ', default='sculptures')
+    parser.add_argument('-o', '--object', help='Description ', default='rose')
     parser.add_argument('--speed', help='fast, medium or slow ', default='fast')
     parser.add_argument('-lr', '--learning_rate', help='Description ', default=5e-5)
     parser.add_argument('-d', '--dev', help='device', required=False, default='cpu')
@@ -415,27 +367,22 @@ if __name__ == "__main__":
     parser.add_argument('--filter_size', help='latent var for nerf', required=False, default=128)
     parser.add_argument('--num_enc_functions', help='encoding functions', required=False, default=5)
     parser.add_argument('--checkpoint', help='Checkpoint to continue training from', default=None)
-    parser.add_argument('--step_every_img', help='Description ', default=True)
     parser.add_argument('--save_dir', help='dir to save models ', default='/tmp/deep_shadow/models/')
     parser.add_argument('--data_path', help='path to dataset ', default='./data/')
-    parser.add_argument('--alternative_light_uv_method', help='Description ', default=True)
+    parser.add_argument('--use_clearml', help='Use clear-ml for logging ', default=True)
+
     args_ = parser.parse_args()
 
-    task_name_ = f"VERIFY2_dev={args_.dev} {args_.object} Step_gamma_0.9 {args_.learning_rate} L2+L1 enc_func={args_.num_enc_functions}" \
-                f"filter_size={args_.filter_size} learned_mult init to 11"
+    task_name_ = f"{args_.object} LR={args_.learning_rate}"
     task_name_ = task_name_.replace(" ", "_")
 
     if not os.path.isdir(args_.save_dir):
         os.makedirs(args_.save_dir, mode=0o777)
 
-
-    use_clearml_ = True
-    if use_clearml_:
+    if args_.use_clearml:
         from clearml import Task, Logger
         task = Task.init(project_name="nerf2D_shading", task_name=task_name_)
         matplotlib.use('pdf')
-
-    writer = SummaryWriter(task_name_)
 
     # seed everything
     torch.manual_seed(1)
@@ -446,4 +393,4 @@ if __name__ == "__main__":
     print(f"Running: {task_name_}")
     print(" ---------------------------------------------------------- ")
 
-    run(args_, task_name_, use_clearml_)
+    run(args_, task_name_)

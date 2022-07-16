@@ -50,6 +50,7 @@ def readEXR(filename):
 	Z = channelData['R']
 	return Z
 
+
 class ShadowDataset(data.Dataset):
 	def __init__(self, root, args, normalize_lights=True):
 		self.root = os.path.join(root)
