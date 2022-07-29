@@ -3,8 +3,9 @@ from torch.utils.tensorboard import SummaryWriter
 import random
 
 from datasets.ShadowData import ShadowDataset
-from utils import *
-from viewshed import *
+from utils import norm_diff, positional_encoding, depth_map_to_pointcloud
+from utils import get_camera_extrinsics, get_camera_intrinsics, get_ray_bundle, pnt_world_coords_to_pixel_coords
+from viewshed import get_los_2d_worldcoords, gen_lines_from_src_to_points, generate_square_boundaries
 from network import DepthNerf
 
 import matplotlib
@@ -17,7 +18,6 @@ import argparse
 import kornia
 import time
 
-from PIL import Image
 
 def prep_data_for_training(data_loader, args):
     train_loader_idx = np.arange(len(data_loader))
@@ -83,14 +83,16 @@ def run(args, task_name):
 
     factor = data_loader.depth_exr.max()  # initialize model with maximum depth
     num_encoding_functions = args.num_enc_functions
-    depth_nerf = DepthNerf(num_encoding_functions, factor=factor, args=args).to(args.dev)
+    depth_nerf = DepthNerf(num_encoding_functions, factor=factor, args=args)
+    if args.mixed:
+        depth_nerf = depth_nerf.cuda()
 
     depth_params = set(depth_nerf.parameters())-set([depth_nerf.factor])  # don't optimize factor
 
     criterion = torch.nn.L1Loss()
     criterion2 = torch.nn.MSELoss()
     optimizer = torch.optim.AdamW(depth_params, lr=args.learning_rate, weight_decay=1e-6)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.epochs // 18, gamma=0.9, verbose=False)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=75, gamma=0.9, verbose=False)
 
     if args.checkpoint:
         print(f"Loading from checkpoint {args.checkpoint}")
@@ -112,9 +114,8 @@ def run(args, task_name):
     # pre-calculate and cache all lines for sampling the predicted depth, since these are expensive calculations
     def pre_gen_lines_arr(boundary_subsampling_factor, xyz):
         lines_arr = []
-        num_points_on_square_boundary = min(w, h) / boundary_subsampling_factor
         boundary_points = generate_square_boundaries(top_left=(0, 0), bottom_right=(w - 1, h - 1),
-            num_points=num_points_on_square_boundary)
+                                                        boundary_subsampling_factor=boundary_subsampling_factor)
 
         # all coordinate points (used instead of boundary points, if those aren't used)
         all_points = get_ray_bundle(h, w, normalize=False).reshape((-1, 2)).to(args.dev)
@@ -133,17 +134,24 @@ def run(args, task_name):
         return lines_arr
 
     # boundary sampling scheme
-    iter_sampling_pairs = {
-                            0: 5,
-                            args.epochs // 4: 4,
-                            args.epochs // 3: 3,
-                            args.epochs // 2: 1,
-                            }
+    if args.boundary_sampling:
+        iter_sampling_pairs = {
+                                0: 4,
+                                args.epochs // 4: 3,
+                                args.epochs // 3: 2,
+                                args.epochs // 2: 1,
+                                }
+    else:
+        iter_sampling_pairs = {0: 1}  # dense boundary sampling from first iteration
 
     def train_single_light_src(light_idx, depth_nerf, optimizer, running_loss):
         shadow_hat = torch.zeros_like(depth_map, device=args.dev, dtype=torch.float32)
         noise = torch.randn_like(all_depth_coords_encoded) * 0.0001
-        depth_hat = depth_nerf(all_depth_coords_encoded + noise).reshape(w, h)
+        if args.mixed:
+            depth_hat = depth_nerf((all_depth_coords_encoded + noise).cuda()).reshape(w, h).cpu()
+        else:
+            depth_hat = depth_nerf((all_depth_coords_encoded + noise)).reshape(w, h)
+
         xyz = depth_map_to_pointcloud(depth_hat, K, RT, w, h).unsqueeze(0).permute(0, 3, 1, 2)
 
         lines = lines_arr[light_idx]
@@ -154,26 +162,21 @@ def run(args, task_name):
                 line = line.flip(1)
             shaded_gt = shade_maps[light_idx]
             line_sample_coords = line.round().long()
-            # sample shade map along coordinate line, nearest neighbor interpolation
-            shaded_gt_line_sampled = shaded_gt.T[[*line_sample_coords]]
 
             pred_shading, real_shading = get_los_2d_worldcoords(light_sources_xyz[light_idx],
                 line, xyz.squeeze(), temp=args.temp, eps=1e-4 if iter < (args.epochs * 0.8) else 1e-5,
                 return_last_points_only=(not speed_up_calculation))
 
+            # sample shade map along coordinate line, nearest neighbor interpolation
             if speed_up_calculation:
                 shadow_hat[[*line_sample_coords]] = pred_shading.float()
             else:
                 shadow_hat[[*line_sample_coords[:, -1]]] = pred_shading
 
         loss = criterion(shaded_gt, shadow_hat) + criterion2(shaded_gt, shadow_hat)
-        # if iter > 250:
         loss += 0.1 * kornia.losses.inverse_depth_smoothness_loss(depth_hat.view(1, 1, w, h), img_mean.unsqueeze(0))
-        # else:
-        #     loss += 0.1 * (depth_hat - kornia.filters.box_blur(depth_hat.view(1, 1, w, h), (3, 3)).squeeze()).abs().mean()
         running_loss += loss
 
-        # take backwards step on every image
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
@@ -310,7 +313,7 @@ def run(args, task_name):
                 (data_loader.silhouette_gt.unsqueeze(0).cpu().numpy()
                  * ((normals_kornia.cpu().numpy().transpose(2, 0, 1) + 1) / 2)), iter)
 
-            writer.add_image('normals_err_map', angular_error.cpu().numpy()[np.newaxis, ...], iter)
+            writer.add_image('normals_err_map', angular_error.cpu().numpy()[np.newaxis, ...], iter)  # fixme!!
             writer.add_image('normals_GT', data_loader.silhouette_gt.unsqueeze(0).cpu().numpy()
                     * 0.5 * (data_loader.normal_gt + 1).cpu().numpy(), iter)
 
@@ -331,7 +334,12 @@ def run(args, task_name):
         # coarse to fine boundary sampling:
         if iter in iter_sampling_pairs.keys():
             noise = torch.randn_like(all_depth_coords_encoded) * 0.0001
-            depth_hat = depth_nerf(all_depth_coords_encoded + noise).reshape(w, h)
+
+            if args.mixed:
+                depth_hat = depth_nerf((all_depth_coords_encoded + noise).cuda()).reshape(w, h).to("cpu")
+            else:
+                depth_hat = depth_nerf((all_depth_coords_encoded + noise)).reshape(w, h)
+
             xyz = depth_map_to_pointcloud(depth_hat, K, RT, w, h).unsqueeze(0).permute(0, 3, 1, 2)
             lines_arr = pre_gen_lines_arr(iter_sampling_pairs[iter], xyz)
 
@@ -351,17 +359,19 @@ def run(args, task_name):
 
         # every X iterations, print error between GT depth and predicted depth
         if iter % 50 == 0:
-            depth_hat = depth_nerf(all_depth_coords_encoded).reshape(w, h)
+            if args.mixed:
+                depth_hat = depth_nerf(all_depth_coords_encoded.cuda()).reshape(w, h).cpu()
+            else:
+                depth_hat = depth_nerf(all_depth_coords_encoded).reshape(w, h)
             test(depth_hat, writer)
-            # profiler.step()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Description of your program')
-    parser.add_argument('-o', '--object', help='Description ', default='rose')
+    parser.add_argument('-o', '--object', help='Description ', default='cactus')
     parser.add_argument('--speed', help='fast, medium or slow ', default='fast')
     parser.add_argument('-lr', '--learning_rate', help='Description ', default=5e-5)
-    parser.add_argument('-d', '--dev', help='device', required=False, default='cpu')
+    parser.add_argument('-d', '--dev', help='device: cpu, cuda or mixed', required=False, default='mixed')
     parser.add_argument('--temp', help='temp of sigmoid', required=False, default=-25)
     parser.add_argument('--epochs', help='epochs', required=False, type=int, default=1300)
     parser.add_argument('--filter_size', help='latent var for nerf', required=False, default=128)
@@ -369,12 +379,19 @@ if __name__ == "__main__":
     parser.add_argument('--checkpoint', help='Checkpoint to continue training from', default=None)
     parser.add_argument('--save_dir', help='dir to save models ', default='/tmp/deep_shadow/models/')
     parser.add_argument('--data_path', help='path to dataset ', default='./data/')
-    parser.add_argument('--use_clearml', help='Use clear-ml for logging ', default=True)
+    parser.add_argument('--boundary_sampling', help='Sub-sample image boundary ', default=False)
+    parser.add_argument('--use_clearml', help='Use clear-ml for logging ', default=False)
 
     args_ = parser.parse_args()
 
-    task_name_ = f"{args_.object} LR={args_.learning_rate}"
+    task_name_ = f"{args_.object} LR={args_.learning_rate} dev={args_.dev}"
     task_name_ = task_name_.replace(" ", "_")
+
+    if args_.dev == "mixed":
+        args_.dev = "cpu"
+        args_.mixed = True
+    else:
+        args_.mixed = False
 
     if not os.path.isdir(args_.save_dir):
         os.makedirs(args_.save_dir, mode=0o777)

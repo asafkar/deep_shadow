@@ -5,10 +5,7 @@ kornia
 matplotlib
 numpy
 opencv_python
-pandas
 scikit_image
-scikit_learn
-scipy
 scikit-image
 tensorboard
 torch>1.8
