@@ -5,7 +5,7 @@ implementation for ECCV 2022 paper:
 
 The overview of our architecture is shown below:
 
-<img src="figures/algo_overview.svg" width="800" height="250">
+<img src="figures/algo_overview.svg" width="700">
 
 ## Requirements
 
@@ -18,6 +18,8 @@ The overview of our architecture is shown below:
 * python
 
 Our code was tested using Python 3.7/3.8 under Ubuntu 18.04, with GPU and/or CPU.
+We used https://clear.ml/ for tracking our experiments - it can be used
+by installing it and using the use_clearml flag.
 
 ## Dataset Used in Paper
 Download the data from https://faculty.runi.ac.il/toky/Pub/DeepShadowData.zip and unzip to ./data 
