@@ -5,7 +5,7 @@ implementation for ECCV 2022 paper:
 
 The overview of our architecture is shown below:
 
-<img src="figures/algo_overview.svg" width="700">
+<img src="figures/algo_overview.svg" width="700" style="background-color: white">
 
 ## Requirements
 
