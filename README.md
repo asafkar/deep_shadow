@@ -38,16 +38,12 @@ and Surface Normal map.
 git clone https://github.com/asafkar/deep_shadow.git
 cd deep_shadow/
 ```
-2. Download and unzip the data
-```bash
-wget https://faculty.runi.ac.il/toky/Pub/DeepShadowData.zip
-unzip DeepShadowData.zip -d ./data/
 ```
-3. Install requirements
+2. Install requirements
 ```bash
 pip install -r requirements.txt
 ```
-4. Run optimization on one of the objects in the 'data' folder
+3. Run optimization on one of the objects in the 'data' folder
 ```bash
 python train.py --object <object name>
 ```
