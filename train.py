@@ -142,7 +142,7 @@ def run(args, task_name):
                                 args.epochs // 2: 1,
                                 }
     else:
-        iter_sampling_pairs = {0: 1}  # dense boundary sampling from first iteration
+        iter_sampling_pairs = {0: 1}
 
     def train_single_light_src(light_idx, depth_nerf, optimizer, running_loss):
         shadow_hat = torch.zeros_like(depth_map, device=args.dev, dtype=torch.float32)
@@ -237,8 +237,7 @@ def run(args, task_name):
 
             # calculate all predicted shadows and save them to grid
             shadows_hat_arr = []
-            num_points_on_square_boundary = w
-            boundary_points = generate_square_boundaries((0, 0), (w - 1, h - 1), num_points_on_square_boundary)
+            boundary_points = generate_square_boundaries((0, 0), (w - 1, h - 1), 1)
             all_points = get_ray_bundle(h, w, normalize=False).reshape((-1, 2)).to(args.dev)
 
             points_to_calc = boundary_points if speed_up_calculation else all_points
@@ -331,8 +330,9 @@ def run(args, task_name):
         else:
             args.temp = -80
 
-        # coarse to fine boundary sampling:
-        if iter in iter_sampling_pairs.keys():
+        # re-generate lines
+        if (not args.boundary_sampling and iter % 100 == 0) or \
+                    (args.boundary_sampling and iter in iter_sampling_pairs.keys()):
             noise = torch.randn_like(all_depth_coords_encoded) * 0.0001
 
             if args.mixed:
@@ -341,7 +341,11 @@ def run(args, task_name):
                 depth_hat = depth_nerf((all_depth_coords_encoded + noise)).reshape(w, h)
 
             xyz = depth_map_to_pointcloud(depth_hat, K, RT, w, h).unsqueeze(0).permute(0, 3, 1, 2)
-            lines_arr = pre_gen_lines_arr(iter_sampling_pairs[iter], xyz)
+
+            if args.boundary_sampling:  # regenerate sampling lines according to boundary sampling
+                lines_arr = pre_gen_lines_arr(iter_sampling_pairs[iter], xyz)
+            else:  # regenerate lines every 100 iters
+                lines_arr = pre_gen_lines_arr(iter_sampling_pairs[0], xyz)
 
         running_loss = 0.0
         for idx in range(len(light_sources_uv)):  # go over all light sources
